@@ -193,8 +193,10 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 }
 
 func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string) {
-	defer tm.wg.Done()
+
 	started := time.Now()
+
+	defer tm.wg.Done()
 	// First defer to release the server semaphore
 	defer func() {
 		pd := tm.providers[providerName]
@@ -212,14 +214,13 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			tm.delTaskInQueue(task)
 		}
 	}()
-
-	err := tm.HandleWithTimeout(providerName, task, server, tm.HandleTask)
+	err, totalTime := tm.HandleWithTimeout(providerName, task, server, tm.HandleTask)
 	if err != nil {
 		retries := task.GetRetries()
 		maxRetries := task.GetMaxRetries()
 		if retries >= maxRetries || err == sql.ErrNoRows {
 			tm.logger.Error().Err(err).Msgf("[tms|%s|%s|%s] max retries reached", providerName, task.GetID(), server)
-			task.MarkAsFailed(time.Since(started).Milliseconds(), err)
+			task.MarkAsFailed(totalTime, err)
 			task.OnComplete()
 			tm.delTaskInQueue(task)
 		} else {
@@ -229,7 +230,7 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			tm.AddTask(task)
 		}
 	} else {
-		task.MarkAsSuccess(time.Since(started).Milliseconds())
+		task.MarkAsSuccess(totalTime)
 		task.OnComplete()
 		tm.delTaskInQueue(task)
 	}
@@ -254,7 +255,7 @@ func (tm *TaskManagerSimple) Shutdown() {
 
 // func GetTimeoutByProvider(provider string) time.Duration {
 
-func (tm *TaskManagerSimple) HandleWithTimeout(pn string, task ITask, server string, handler func(ITask, string) error) error {
+func (tm *TaskManagerSimple) HandleWithTimeout(pn string, task ITask, server string, handler func(ITask, string) error) (error, int64) {
 	var err error
 	defer func() {
 		if r := recover(); r != nil {
@@ -295,7 +296,7 @@ func (tm *TaskManagerSimple) HandleWithTimeout(pn string, task ITask, server str
 		}
 	}
 
-	return err
+	return err, time.Since(startTime).Milliseconds()
 }
 
 var (
