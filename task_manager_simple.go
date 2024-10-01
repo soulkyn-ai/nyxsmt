@@ -336,11 +336,11 @@ func AddTask(task ITask, logger *zerolog.Logger) {
 func InitTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, tasks []ITask, servers map[string][]string, getTimeout func(string) time.Duration) {
 	taskManagerMutex.Lock()
 	defer taskManagerMutex.Unlock()
-	logger.Warn().Msg("[tms] Task manager initialization STARTED")
+	logger.Info().Msg("[tms] Task manager initialization")
 
 	TaskQueueManagerInstance = NewTaskManagerSimple(providers, servers, logger, getTimeout)
 	TaskQueueManagerInstance.Start()
-	logger.Warn().Msg("[tms] Task manager initialized")
+	logger.Info().Msg("[tms] Task manager started")
 
 	// Signal that the TaskManager is ready
 	taskManagerCond.Broadcast()
