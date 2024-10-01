@@ -224,7 +224,7 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			task.OnComplete()
 			tm.delTaskInQueue(task)
 		} else {
-			tm.logger.Warn().Err(err).Msgf("[tms|%s|%s|%s] retrying (%d/%d)", providerName, task.GetID(), server, retries+1, maxRetries)
+			tm.logger.Debug().Err(err).Msgf("[tms|%s|%s|%s] retrying (%d/%d)", providerName, task.GetID(), server, retries+1, maxRetries)
 			task.UpdateRetries(retries + 1)
 			tm.delTaskInQueue(task)
 			tm.AddTask(task)
@@ -244,13 +244,13 @@ func (tm *TaskManagerSimple) HandleTask(task ITask, server string) error {
 
 func (tm *TaskManagerSimple) Shutdown() {
 	if !tm.IsRunning() {
-		tm.logger.Warn().Msg("[TASKS] Task manager shutdown [ALREADY STOPPED]")
+		tm.logger.Debug().Msg("[tms] Task manager shutdown [ALREADY STOPPED]")
 		return
 	}
 	close(tm.shutdownCh)
 	tm.wg.Wait()
 	atomic.StoreInt32(&tm.isRunning, 0)
-	tm.logger.Warn().Msg("[TASKS] Task manager shutdown [FINISHED]")
+	tm.logger.Debug().Msg("[tms] Task manager shutdown [FINISHED]")
 }
 
 // func GetTimeoutByProvider(provider string) time.Duration {
@@ -260,7 +260,7 @@ func (tm *TaskManagerSimple) HandleWithTimeout(pn string, task ITask, server str
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic occurred: %v", r)
-			tm.logger.Error().Err(err).Msgf("[%s|%s|%s] panic in task", pn, task.GetID(), server)
+			tm.logger.Error().Err(err).Msgf("[tms|%s|%s|%s] panic in task", pn, task.GetID(), server)
 		}
 	}()
 
@@ -275,24 +275,24 @@ func (tm *TaskManagerSimple) HandleWithTimeout(pn string, task ITask, server str
 		defer func() {
 			if r := recover(); r != nil {
 				err := fmt.Errorf("panic occurred in handler: %v\n%s", r, string(debug.Stack()))
-				tm.logger.Error().Err(err).Msgf("[%s|%s|%s] panic in handler", pn, task.GetID(), server)
+				tm.logger.Error().Err(err).Msgf("[tms|%s|%s|%s] panic in handler", pn, task.GetID(), server)
 				done <- err
 			}
 		}()
 
-		tm.logger.Warn().Msgf("[%s|%s] Task STARTED on server %s", pn, task.GetID(), server)
+		tm.logger.Debug().Msgf("[tms|%s|%s] Task STARTED on server %s", pn, task.GetID(), server)
 		done <- handler(task, server)
 	}()
 
 	select {
 	case <-ctx.Done():
-		err = fmt.Errorf("[%s|%s] Task timed out on server %s", pn, task.GetID(), server)
+		err = fmt.Errorf("[tms|%s|%s] Task timed out on server %s", pn, task.GetID(), server)
 		tm.logger.Error().Err(err).Msgf("[%s|%s] Task FAILED-TIMEOUT on server %s, took %s", pn, task.GetID(), server, time.Since(startTime))
 	case err = <-done:
 		if err == nil {
-			tm.logger.Warn().Msgf("[%s|%s] Task COMPLETED on server %s, took %s", pn, task.GetID(), server, time.Since(startTime))
+			tm.logger.Debug().Msgf("[tms|%s|%s] Task COMPLETED on server %s, took %s", pn, task.GetID(), server, time.Since(startTime))
 		} else {
-			tm.logger.Error().Err(err).Msgf("[%s|%s] Task FAILED on server %s, took %s", pn, task.GetID(), server, time.Since(startTime))
+			tm.logger.Error().Err(err).Msgf("[tms|%s|%s] Task FAILED on server %s, took %s", pn, task.GetID(), server, time.Since(startTime))
 		}
 	}
 
@@ -311,7 +311,7 @@ func AddTask(task ITask, logger *zerolog.Logger) {
 	tries := 0
 	for {
 		if tries >= addMaxRetries {
-			logger.Error().Msg("[MS] Task not added, max retries reached")
+			logger.Error().Msg("[tms|add-task] Task not added, max retries reached")
 			return
 		}
 		taskManagerMutex.Lock()
@@ -323,7 +323,7 @@ func AddTask(task ITask, logger *zerolog.Logger) {
 
 		// Try to add the task
 		if added := tmInstance.AddTask(task); !added {
-			logger.Warn().Msg("[MS] Task not added, retrying")
+			logger.Debug().Msg("[tms|add-task] Task not added, retrying")
 			time.Sleep(250 * time.Millisecond)
 			tries++
 			continue
@@ -336,11 +336,11 @@ func AddTask(task ITask, logger *zerolog.Logger) {
 func InitTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, tasks []ITask, servers map[string][]string, getTimeout func(string) time.Duration) {
 	taskManagerMutex.Lock()
 	defer taskManagerMutex.Unlock()
-	logger.Warn().Msg("[TASKS] Task manager initialization STARTED")
+	logger.Warn().Msg("[tms] Task manager initialization STARTED")
 
 	TaskQueueManagerInstance = NewTaskManagerSimple(providers, servers, logger, getTimeout)
 	TaskQueueManagerInstance.Start()
-	logger.Warn().Msg("[TASKS] Task manager initialized")
+	logger.Warn().Msg("[tms] Task manager initialized")
 
 	// Signal that the TaskManager is ready
 	taskManagerCond.Broadcast()
@@ -351,5 +351,5 @@ func InitTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, tasks 
 func RequeueTaskIfNeeded(logger *zerolog.Logger, tasks []ITask) {
 	// Get all uncompleted tasks
 	count, _ := TaskQueueManagerInstance.AddTasks(tasks)
-	logger.Error().Msgf("[TASKS] Requeued %d / %d tasks", count, len(tasks))
+	logger.Info().Msgf("[tms] Requeued %d. (%d tasks in queue)", count, len(tasks))
 }
