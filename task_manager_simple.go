@@ -181,12 +181,13 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 				}
 			}
 			if !serverFound {
-				tm.logger.Debug().Msgf("[tms|%s|%s] No available servers, requeuing task", providerName, task.GetID())
-				pd.taskQueueLock.Lock()
-				heap.Push(&pd.taskQueue, taskWithPriority)
-				pd.taskQueueLock.Unlock()
-
-				time.Sleep(250 * time.Millisecond)
+				go func() {
+					time.Sleep(1 * time.Second)
+					tm.logger.Warn().Msgf("[tms|%s|%s] No available servers, requeuing task", providerName, task.GetID())
+					pd.taskQueueLock.Lock()
+					heap.Push(&pd.taskQueue, taskWithPriority)
+					pd.taskQueueLock.Unlock()
+				}()
 			}
 		}
 	}
