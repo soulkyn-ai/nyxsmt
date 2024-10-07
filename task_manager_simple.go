@@ -182,18 +182,8 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 			}
 			if !serverFound {
 				go func() {
-					time.Sleep(1 * time.Second)
-					tm.logger.Warn().Msgf("[tms|%s|%s] No available servers, requeuing task", providerName, task.GetID())
-					// increase task failure count
-					task.UpdateRetries(task.GetRetries() + 1)
-					if task.GetRetries() >= task.GetMaxRetries() {
-						tm.logger.Error().Msgf("[tms|%s|%s] Max retries reached, task failed", providerName, task.GetID())
-						task.MarkAsFailed(0, fmt.Errorf("max retries reached"))
-						task.OnComplete()
-						tm.delTaskInQueue(task)
-						return
-					}
-					// request task using AddTask (delete task from queue)
+					time.Sleep(250 * time.Millisecond)
+					tm.logger.Debug().Msgf("[tms|%s|%s] No available servers, requeuing task", providerName, task.GetID())
 					tm.delTaskInQueue(task)
 					tm.AddTask(task)
 				}()
