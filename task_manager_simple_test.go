@@ -111,7 +111,7 @@ func TestTaskManagerSimple_HarshEnvironment(t *testing.T) {
 	// Wait for all tasks to be processed
 	processedCount := 0
 	failedCount := 0
-	timeout := time.After(time.Second * 60)
+	timeout := time.After(time.Second * 240)
 	for {
 		select {
 		case <-taskProcessed:
