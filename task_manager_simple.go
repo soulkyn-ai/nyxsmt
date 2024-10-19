@@ -308,6 +308,9 @@ var (
 
 // AddTask is the function to be called to add tasks externally
 func AddTask(task ITask, logger *zerolog.Logger) {
+	if TaskQueueManagerInstance == nil || !TaskQueueManagerInstance.IsRunning() {
+		return
+	}
 	tries := 0
 	for {
 		if tries >= addMaxRetries {
