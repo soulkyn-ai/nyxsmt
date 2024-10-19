@@ -19,6 +19,7 @@ type TaskManagerSimple struct {
 	taskInQueue     map[string]bool
 	taskInQueueLock sync.RWMutex
 	isRunning       int32
+	shutdownRequest int32
 	shutdownCh      chan struct{}
 	wg              sync.WaitGroup
 	logger          *zerolog.Logger
@@ -38,6 +39,7 @@ func NewTaskManagerSimple(providers *[]IProvider, servers map[string][]string, l
 		taskInQueue:     make(map[string]bool),
 		taskInQueueLock: sync.RWMutex{},
 		isRunning:       0,
+		shutdownRequest: 0,
 		shutdownCh:      make(chan struct{}),
 		logger:          logger,
 		getTimeout:      getTimeout,
@@ -64,7 +66,9 @@ func NewTaskManagerSimple(providers *[]IProvider, servers map[string][]string, l
 
 	return tm
 }
-
+func (tm *TaskManagerSimple) HasShutdownRequest() bool {
+	return atomic.LoadInt32(&tm.shutdownRequest) == 1
+}
 func (tm *TaskManagerSimple) IsRunning() bool {
 	return atomic.LoadInt32(&tm.isRunning) == 1
 }
@@ -247,6 +251,7 @@ func (tm *TaskManagerSimple) Shutdown() {
 		tm.logger.Debug().Msg("[tms] Task manager shutdown [ALREADY STOPPED]")
 		return
 	}
+	atomic.StoreInt32(&tm.shutdownRequest, 1)
 	close(tm.shutdownCh)
 	tm.wg.Wait()
 	atomic.StoreInt32(&tm.isRunning, 0)
@@ -308,7 +313,7 @@ var (
 
 // AddTask is the function to be called to add tasks externally
 func AddTask(task ITask, logger *zerolog.Logger) {
-	if TaskQueueManagerInstance == nil || !TaskQueueManagerInstance.IsRunning() {
+	if TaskQueueManagerInstance == nil || !TaskQueueManagerInstance.HasShutdownRequest() {
 		return
 	}
 	tries := 0
