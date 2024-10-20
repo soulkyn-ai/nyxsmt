@@ -2,6 +2,7 @@ package nyxsmt
 
 import (
 	"errors"
+	"os"
 	"strconv"
 	"sync"
 	"testing"
@@ -140,4 +141,44 @@ Finished:
 
 	// Shutdown TaskManager
 	TaskQueueManagerInstance.Shutdown()
+}
+
+// Tests for AddTask with nil provider
+func TestAddTaskWithNilProvider(t *testing.T) {
+	logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout}).With().Timestamp().Logger()
+
+	// Initialize TaskManagerSimple with no providers for simplicity
+	providers := []IProvider{}
+	servers := map[string][]string{}
+	getTimeout := func(string) time.Duration { return time.Second * 10 }
+	tm := NewTaskManagerSimple(&providers, servers, &logger, getTimeout)
+	tm.Start()
+	defer tm.Shutdown()
+
+	// Create a task with nil provider
+	task := &MockTask{
+		id:         "task_with_nil_provider",
+		priority:   1,
+		maxRetries: 3,
+		createdAt:  time.Now(),
+		provider:   nil, // Nil provider
+		timeout:    time.Second * 10,
+	}
+
+	added := tm.AddTask(task)
+	if added {
+		t.Error("Expected AddTask to return false for task with nil provider")
+	}
+
+	if !task.failed {
+		t.Error("Expected task to be marked as failed due to nil provider")
+	}
+
+	if task.lastError != "task 'task_with_nil_provider' has no provider" {
+		t.Errorf("Unexpected error message: %s", task.lastError)
+	}
+
+	if !task.completeCalled {
+		t.Error("Expected OnComplete to be called for task with nil provider")
+	}
 }

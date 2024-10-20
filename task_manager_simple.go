@@ -110,7 +110,17 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 	}
 	tm.setTaskInQueue(task, true)
 
-	providerName := task.GetProvider().Name()
+	provider := task.GetProvider()
+	if provider == nil {
+		err := fmt.Errorf("task '%s' has no provider", task.GetID())
+		tm.logger.Error().Err(err).Msg("[tms|nil_provider|error] error")
+		task.MarkAsFailed(0, err)
+		task.OnComplete()
+		tm.delTaskInQueue(task)
+		return false
+	}
+
+	providerName := provider.Name()
 	pd, ok := tm.providers[providerName]
 	if !ok {
 		err := fmt.Errorf("provider '%s' not found", providerName)
