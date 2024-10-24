@@ -13,10 +13,10 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// Task manager simple interface (task_manager_simple.go)
+// TaskManagerSimple interface (optimized)
 type TaskManagerSimple struct {
 	providers       map[string]*ProviderData
-	taskInQueue     sync.Map // Replaces map[string]bool and its lock
+	taskInQueue     sync.Map
 	isRunning       int32
 	shutdownRequest int32
 	shutdownCh      chan struct{}
@@ -26,10 +26,11 @@ type TaskManagerSimple struct {
 }
 
 type ProviderData struct {
-	taskQueue     TaskQueuePrio
-	taskQueueLock sync.Mutex
-	servers       []string
-	serverWorkers map[string]chan struct{}
+	taskQueue        TaskQueuePrio
+	taskQueueLock    sync.Mutex
+	taskQueueCond    *sync.Cond
+	servers          []string
+	availableServers chan string
 }
 
 func NewTaskManagerSimple(providers *[]IProvider, servers map[string][]string, logger *zerolog.Logger, getTimeout func(string) time.Duration) *TaskManagerSimple {
@@ -50,14 +51,16 @@ func NewTaskManagerSimple(providers *[]IProvider, servers map[string][]string, l
 			serverList = []string{}
 		}
 		pd := &ProviderData{
-			taskQueue:     TaskQueuePrio{},
-			taskQueueLock: sync.Mutex{},
-			servers:       serverList,
-			serverWorkers: make(map[string]chan struct{}),
+			taskQueue:        TaskQueuePrio{},
+			taskQueueLock:    sync.Mutex{},
+			taskQueueCond:    sync.NewCond(&sync.Mutex{}),
+			servers:          serverList,
+			availableServers: make(chan string, len(serverList)),
 		}
 		for _, server := range serverList {
-			pd.serverWorkers[server] = make(chan struct{}, 1) // Buffered channel with capacity 1
+			pd.availableServers <- server
 		}
+		pd.taskQueueCond = sync.NewCond(&pd.taskQueueLock)
 		tm.providers[providerName] = pd
 	}
 
@@ -131,6 +134,7 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 		task:     task,
 		priority: task.GetPriority(),
 	})
+	pd.taskQueueCond.Signal() // Signal that a new task is available
 
 	return true
 }
@@ -153,47 +157,27 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 	pd := tm.providers[providerName]
 
 	for {
+		pd.taskQueueLock.Lock()
+		for pd.taskQueue.Len() == 0 && !tm.HasShutdownRequest() {
+			pd.taskQueueCond.Wait()
+		}
+		if tm.HasShutdownRequest() {
+			pd.taskQueueLock.Unlock()
+			return
+		}
+		// Get the next task
+		taskWithPriority := heap.Pop(&pd.taskQueue).(*TaskWithPriority)
+		pd.taskQueueLock.Unlock()
+		task := taskWithPriority.task
+
+		// Wait for an available server
 		select {
 		case <-tm.shutdownCh:
 			return
-		default:
-			// Lock the task queue
-			pd.taskQueueLock.Lock()
-			if pd.taskQueue.Len() == 0 {
-				pd.taskQueueLock.Unlock()
-				// Wait until new tasks are added
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
-			// Get the next task
-			taskWithPriority := heap.Pop(&pd.taskQueue).(*TaskWithPriority)
-			pd.taskQueueLock.Unlock()
-			task := taskWithPriority.task
-
-			// Find an available server
-			serverFound := false
-		loop:
-			for _, server := range pd.servers {
-				serverChan := pd.serverWorkers[server]
-				select {
-				case serverChan <- struct{}{}:
-					// We got the server, process the task
-					serverFound = true
-					tm.wg.Add(1)
-					go tm.processTask(task, providerName, server)
-					break loop
-				default:
-					// Server is busy
-				}
-			}
-			if !serverFound {
-				// No server available, push the task back into the queue
-				pd.taskQueueLock.Lock()
-				heap.Push(&pd.taskQueue, taskWithPriority)
-				pd.taskQueueLock.Unlock()
-				// Wait until a server becomes available
-				time.Sleep(100 * time.Millisecond)
-			}
+		case server := <-pd.availableServers:
+			// We got a server, process the task
+			tm.wg.Add(1)
+			go tm.processTask(task, providerName, server)
 		}
 	}
 }
@@ -202,22 +186,14 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 	started := time.Now()
 
 	defer tm.wg.Done()
-	// First defer to release the server semaphore
 	defer func() {
+		// Return the server to the available servers pool
 		pd, ok := tm.providers[providerName]
-		if !ok || pd == nil {
-			tm.logger.Error().Msgf("[tms|%s|%s|%s] provider data not found or nil in defer", providerName, task.GetID(), server)
-			return
+		if ok {
+			pd.availableServers <- server
 		}
-		serverChan, ok := pd.serverWorkers[server]
-		if !ok || serverChan == nil {
-			tm.logger.Error().Msgf("[tms|%s|%s|%s] server worker not found or nil in defer", providerName, task.GetID(), server)
-			return
-		}
-		<-serverChan
 	}()
-
-	// Second defer to handle panics
+	// Handle panics
 	defer func() {
 		if r := recover(); r != nil {
 			err := fmt.Errorf("panic occurred: %v\n%s", r, string(debug.Stack()))
@@ -227,6 +203,7 @@ func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string
 			tm.delTaskInQueue(task)
 		}
 	}()
+
 	err, totalTime := tm.HandleWithTimeout(providerName, task, server, tm.HandleTask)
 	if err != nil {
 		retries := task.GetRetries()
@@ -262,6 +239,14 @@ func (tm *TaskManagerSimple) Shutdown() {
 	}
 	atomic.StoreInt32(&tm.shutdownRequest, 1)
 	close(tm.shutdownCh)
+
+	// Signal all provider dispatchers to wake up
+	for _, pd := range tm.providers {
+		pd.taskQueueLock.Lock()
+		pd.taskQueueCond.Broadcast()
+		pd.taskQueueLock.Unlock()
+	}
+
 	tm.wg.Wait()
 	atomic.StoreInt32(&tm.isRunning, 0)
 	tm.logger.Debug().Msg("[tms] Task manager shutdown [FINISHED]")
@@ -334,11 +319,13 @@ func InitTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, tasks 
 	// Add uncompleted tasks
 	RequeueTaskIfNeeded(logger, tasks)
 }
+
 func RequeueTaskIfNeeded(logger *zerolog.Logger, tasks []ITask) {
 	// Get all uncompleted tasks
 	count, _ := TaskQueueManagerInstance.AddTasks(tasks)
 	logger.Info().Msgf("[tms] Requeued %d. (%d tasks in queue)", count, len(tasks))
 }
+
 func AddTask(task ITask, logger *zerolog.Logger) {
 	if TaskQueueManagerInstance == nil || TaskQueueManagerInstance.HasShutdownRequest() {
 		return
