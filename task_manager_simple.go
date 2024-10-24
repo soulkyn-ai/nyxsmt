@@ -16,8 +16,7 @@ import (
 // Task manager simple interface (task_manager_simple.go)
 type TaskManagerSimple struct {
 	providers       map[string]*ProviderData
-	taskInQueue     map[string]bool
-	taskInQueueLock sync.RWMutex
+	taskInQueue     sync.Map // Replaces map[string]bool and its lock
 	isRunning       int32
 	shutdownRequest int32
 	shutdownCh      chan struct{}
@@ -36,8 +35,6 @@ type ProviderData struct {
 func NewTaskManagerSimple(providers *[]IProvider, servers map[string][]string, logger *zerolog.Logger, getTimeout func(string) time.Duration) *TaskManagerSimple {
 	tm := &TaskManagerSimple{
 		providers:       make(map[string]*ProviderData),
-		taskInQueue:     make(map[string]bool),
-		taskInQueueLock: sync.RWMutex{},
 		isRunning:       0,
 		shutdownRequest: 0,
 		shutdownCh:      make(chan struct{}),
@@ -66,29 +63,26 @@ func NewTaskManagerSimple(providers *[]IProvider, servers map[string][]string, l
 
 	return tm
 }
+
 func (tm *TaskManagerSimple) HasShutdownRequest() bool {
 	return atomic.LoadInt32(&tm.shutdownRequest) == 1
 }
+
 func (tm *TaskManagerSimple) IsRunning() bool {
 	return atomic.LoadInt32(&tm.isRunning) == 1
 }
 
-func (tm *TaskManagerSimple) setTaskInQueue(task ITask, inQueue bool) {
-	tm.taskInQueueLock.Lock()
-	defer tm.taskInQueueLock.Unlock()
-	tm.taskInQueue[task.GetID()] = inQueue
+func (tm *TaskManagerSimple) setTaskInQueue(task ITask) {
+	tm.taskInQueue.Store(task.GetID(), struct{}{})
 }
 
 func (tm *TaskManagerSimple) isTaskInQueue(task ITask) bool {
-	tm.taskInQueueLock.RLock()
-	defer tm.taskInQueueLock.RUnlock()
-	return tm.taskInQueue[task.GetID()]
+	_, ok := tm.taskInQueue.Load(task.GetID())
+	return ok
 }
 
 func (tm *TaskManagerSimple) delTaskInQueue(task ITask) {
-	tm.taskInQueueLock.Lock()
-	defer tm.taskInQueueLock.Unlock()
-	delete(tm.taskInQueue, task.GetID())
+	tm.taskInQueue.Delete(task.GetID())
 }
 
 func (tm *TaskManagerSimple) AddTasks(tasks []ITask) (count int, err error) {
@@ -108,7 +102,7 @@ func (tm *TaskManagerSimple) AddTask(task ITask) bool {
 	if tm.isTaskInQueue(task) {
 		return false
 	}
-	tm.setTaskInQueue(task, true)
+	tm.setTaskInQueue(task)
 
 	provider := task.GetProvider()
 	if provider == nil {
@@ -167,6 +161,7 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 			pd.taskQueueLock.Lock()
 			if pd.taskQueue.Len() == 0 {
 				pd.taskQueueLock.Unlock()
+				// Wait until new tasks are added
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
@@ -186,35 +181,39 @@ func (tm *TaskManagerSimple) providerDispatcher(providerName string) {
 					serverFound = true
 					tm.wg.Add(1)
 					go tm.processTask(task, providerName, server)
-					// Break out of the loop
+					break loop
 				default:
 					// Server is busy
 				}
-				if serverFound {
-					break loop
-				}
 			}
 			if !serverFound {
-				go func() {
-					time.Sleep(250 * time.Millisecond)
-					tm.logger.Debug().Msgf("[tms|%s|%s] No available servers, requeuing task", providerName, task.GetID())
-					tm.delTaskInQueue(task)
-					tm.AddTask(task)
-				}()
+				// No server available, push the task back into the queue
+				pd.taskQueueLock.Lock()
+				heap.Push(&pd.taskQueue, taskWithPriority)
+				pd.taskQueueLock.Unlock()
+				// Wait until a server becomes available
+				time.Sleep(100 * time.Millisecond)
 			}
 		}
 	}
 }
 
 func (tm *TaskManagerSimple) processTask(task ITask, providerName, server string) {
-
 	started := time.Now()
 
 	defer tm.wg.Done()
 	// First defer to release the server semaphore
 	defer func() {
-		pd := tm.providers[providerName]
-		serverChan := pd.serverWorkers[server]
+		pd, ok := tm.providers[providerName]
+		if !ok || pd == nil {
+			tm.logger.Error().Msgf("[tms|%s|%s|%s] provider data not found or nil in defer", providerName, task.GetID(), server)
+			return
+		}
+		serverChan, ok := pd.serverWorkers[server]
+		if !ok || serverChan == nil {
+			tm.logger.Error().Msgf("[tms|%s|%s|%s] server worker not found or nil in defer", providerName, task.GetID(), server)
+			return
+		}
 		<-serverChan
 	}()
 
@@ -268,8 +267,6 @@ func (tm *TaskManagerSimple) Shutdown() {
 	tm.logger.Debug().Msg("[tms] Task manager shutdown [FINISHED]")
 }
 
-// func GetTimeoutByProvider(provider string) time.Duration {
-
 func (tm *TaskManagerSimple) HandleWithTimeout(pn string, task ITask, server string, handler func(ITask, string) error) (error, int64) {
 	var err error
 	defer func() {
@@ -321,7 +318,27 @@ var (
 	addMaxRetries            = 3
 )
 
-// AddTask is the function to be called to add tasks externally
+// Initialize the TaskManager
+func InitTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, tasks []ITask, servers map[string][]string, getTimeout func(string) time.Duration) {
+	taskManagerMutex.Lock()
+	defer taskManagerMutex.Unlock()
+	logger.Info().Msg("[tms] Task manager initialization")
+
+	TaskQueueManagerInstance = NewTaskManagerSimple(providers, servers, logger, getTimeout)
+	TaskQueueManagerInstance.Start()
+	logger.Info().Msg("[tms] Task manager started")
+
+	// Signal that the TaskManager is ready
+	taskManagerCond.Broadcast()
+
+	// Add uncompleted tasks
+	RequeueTaskIfNeeded(logger, tasks)
+}
+func RequeueTaskIfNeeded(logger *zerolog.Logger, tasks []ITask) {
+	// Get all uncompleted tasks
+	count, _ := TaskQueueManagerInstance.AddTasks(tasks)
+	logger.Info().Msgf("[tms] Requeued %d. (%d tasks in queue)", count, len(tasks))
+}
 func AddTask(task ITask, logger *zerolog.Logger) {
 	if TaskQueueManagerInstance == nil || TaskQueueManagerInstance.HasShutdownRequest() {
 		return
@@ -348,26 +365,4 @@ func AddTask(task ITask, logger *zerolog.Logger) {
 		}
 		break
 	}
-}
-
-// Initialize the TaskManager
-func InitTaskQueueManager(logger *zerolog.Logger, providers *[]IProvider, tasks []ITask, servers map[string][]string, getTimeout func(string) time.Duration) {
-	taskManagerMutex.Lock()
-	defer taskManagerMutex.Unlock()
-	logger.Info().Msg("[tms] Task manager initialization")
-
-	TaskQueueManagerInstance = NewTaskManagerSimple(providers, servers, logger, getTimeout)
-	TaskQueueManagerInstance.Start()
-	logger.Info().Msg("[tms] Task manager started")
-
-	// Signal that the TaskManager is ready
-	taskManagerCond.Broadcast()
-
-	// Add uncompleted tasks
-	RequeueTaskIfNeeded(logger, tasks)
-}
-func RequeueTaskIfNeeded(logger *zerolog.Logger, tasks []ITask) {
-	// Get all uncompleted tasks
-	count, _ := TaskQueueManagerInstance.AddTasks(tasks)
-	logger.Info().Msgf("[tms] Requeued %d. (%d tasks in queue)", count, len(tasks))
 }
